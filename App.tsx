@@ -1,11 +1,20 @@
 import { useEffect, useRef, useState } from 'react';
-import { Alert, Pressable, StyleSheet, Text, View } from 'react-native';
+import {
+  Alert,
+  PermissionsAndroid,
+  Platform,
+  Pressable,
+  StyleSheet,
+  Switch,
+  Text,
+  View,
+} from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import * as Battery from 'expo-battery';
 import * as DocumentPicker from 'expo-document-picker';
 import { File, Paths } from 'expo-file-system';
 import { createAudioPlayer } from 'expo-audio';
+import ChargerService from './modules/charger-service';
 
 type Kind = 'connect' | 'disconnect';
 type Sound = { uri: string; name: string };
@@ -18,76 +27,33 @@ const TITLES: Record<Kind, string> = {
   disconnect: 'Ao desconectar o carregador',
 };
 
-// Carregador ligado na tomada (inclui bateria cheia ou carga limitada)
-function isPlugged(state: Battery.BatteryState) {
-  return (
-    state === Battery.BatteryState.CHARGING ||
-    state === Battery.BatteryState.FULL ||
-    state === Battery.BatteryState.NOT_CHARGING
-  );
+// Envia os caminhos dos áudios para o serviço nativo
+function syncNative(sounds: Sounds) {
+  ChargerService.setSounds(sounds.connect?.uri ?? null, sounds.disconnect?.uri ?? null);
 }
 
 export default function App() {
   const [sounds, setSounds] = useState<Sounds>({});
-  const soundsRef = useRef<Sounds>({});
+  const [enabled, setEnabled] = useState(false);
   const playerRef = useRef<ReturnType<typeof createAudioPlayer> | null>(null);
-  const pluggedRef = useRef<boolean | null>(null);
 
-  soundsRef.current = sounds;
-
-  function play(kind: Kind) {
-    const sound = soundsRef.current[kind];
-    if (!sound) return;
-    playerRef.current?.remove();
-    const player = createAudioPlayer({ uri: sound.uri });
-    playerRef.current = player;
-    player.play();
-  }
-
-  // Carrega os sons salvos
+  // Carrega os sons salvos e o estado do serviço
   useEffect(() => {
+    setEnabled(ChargerService.isRunning());
     AsyncStorage.getItem(STORAGE_KEY)
       .then((value) => {
-        if (value) setSounds(JSON.parse(value));
+        if (!value) return;
+        const saved: Sounds = JSON.parse(value);
+        setSounds(saved);
+        syncNative(saved);
       })
       .catch(() => {});
     return () => playerRef.current?.remove();
   }, []);
 
-  // Detecta conexão e desconexão do carregador
-  useEffect(() => {
-    let active = true;
-
-    Battery.getBatteryStateAsync()
-      .then((state) => {
-        if (active && pluggedRef.current === null) {
-          pluggedRef.current = isPlugged(state);
-        }
-      })
-      .catch(() => {});
-
-    const subscription = Battery.addBatteryStateListener(({ batteryState }) => {
-      if (batteryState === Battery.BatteryState.UNKNOWN) return;
-      const plugged = isPlugged(batteryState);
-
-      if (pluggedRef.current === null) {
-        pluggedRef.current = plugged;
-        return;
-      }
-      if (plugged === pluggedRef.current) return;
-
-      pluggedRef.current = plugged;
-      play(plugged ? 'connect' : 'disconnect');
-    });
-
-    return () => {
-      active = false;
-      subscription.remove();
-    };
-  }, []);
-
   async function save(next: Sounds) {
     setSounds(next);
+    syncNative(next);
     await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(next));
   }
 
@@ -118,9 +84,47 @@ export default function App() {
     }
   }
 
+  function test(kind: Kind) {
+    const sound = sounds[kind];
+    if (!sound) return;
+    playerRef.current?.remove();
+    const player = createAudioPlayer({ uri: sound.uri });
+    playerRef.current = player;
+    player.play();
+  }
+
+  async function toggle(value: boolean) {
+    if (!value) {
+      ChargerService.stop();
+      setEnabled(false);
+      return;
+    }
+
+    if (!sounds.connect && !sounds.disconnect) {
+      Alert.alert('Escolha um som', 'Escolha pelo menos um som antes de ativar.');
+      return;
+    }
+
+    // Android 13+ pede permissão para mostrar a notificação do serviço
+    if (Platform.OS === 'android' && Platform.Version >= 33) {
+      await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS);
+    }
+
+    ChargerService.start();
+    setEnabled(true);
+  }
+
   return (
     <View style={styles.container}>
       <Text style={styles.title}>Charger Sounds</Text>
+
+      <View style={[styles.card, styles.switchRow]}>
+        <View style={styles.switchText}>
+          <Text style={styles.cardTitle}>Monitorar em segundo plano</Text>
+          <Text style={styles.fileName}>Mostra uma notificação fixa enquanto estiver ativo</Text>
+        </View>
+        <Switch value={enabled} onValueChange={toggle} />
+      </View>
 
       {(['connect', 'disconnect'] as Kind[]).map((kind) => (
         <View key={kind} style={styles.card}>
@@ -135,7 +139,7 @@ export default function App() {
             <Pressable
               style={[styles.button, !sounds[kind] && styles.disabled]}
               disabled={!sounds[kind]}
-              onPress={() => play(kind)}
+              onPress={() => test(kind)}
             >
               <Text style={styles.buttonText}>Testar</Text>
             </Pressable>
@@ -165,6 +169,15 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     padding: 16,
     marginBottom: 16,
+  },
+  switchRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  switchText: {
+    flex: 1,
+    marginRight: 12,
   },
   cardTitle: {
     fontSize: 16,
